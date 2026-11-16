@@ -14,10 +14,12 @@ async function replace(path, bytes) {
 export async function openArchive(directory) {
   await mkdir(join(directory, 'objects'), {recursive:true});
   const indexPath = join(directory, 'index.json');
-  let index = {version:1, records:[], exchanges:[]};
+  let index = {version:1, records:[], exchanges:[], stream:null};
   try { index = JSON.parse(await readFile(indexPath, 'utf8')); }
   catch (error) { if (error.code !== 'ENOENT') throw error; }
   if (index.version !== 1 || !Array.isArray(index.records) || !Array.isArray(index.exchanges)) throw new Error('归档索引结构无效');
+  if (index.stream === undefined) index.stream = null;
+  if (index.stream !== null && (typeof index.stream !== 'object' || typeof index.stream.nextOffset !== 'number')) throw new Error('流接收状态结构无效');
   for (const exchange of index.exchanges) {
     if (!/^[a-f0-9]{64}$/.test(exchange.hash)) throw new Error('归档摘要无效');
     const bytes = await readFile(join(directory, 'objects', exchange.hash));
@@ -27,6 +29,7 @@ export async function openArchive(directory) {
   return {
     records:() => structuredClone(index.records),
     exchanges:() => structuredClone(index.exchanges),
+    stream:() => index.stream === null ? null : structuredClone(index.stream),
     raw: async hash => {
       if (!/^[a-f0-9]{64}$/.test(hash)) throw new Error('原文摘要无效');
       const bytes = await readFile(join(directory, 'objects', hash));
@@ -54,6 +57,33 @@ export async function openArchive(directory) {
         await replace(indexPath, Buffer.from(JSON.stringify(next, null, 2)));
         index = next;
         return {records:next.records.length,exchanges:next.exchanges.length};
+      });
+      queue = operation.catch(() => {});
+      return operation;
+    },
+    // 流状态与原文凭据在同一份索引、同一个原子写中落盘，崩溃后水位与凭据不分裂
+    commitStream(streamState, exchanges) {
+      const operation = queue.then(async () => {
+        const next = structuredClone(index);
+        for (const exchange of exchanges) {
+          const hash = digest(exchange.bytes);
+          await replace(join(directory, 'objects', hash), exchange.bytes);
+          const receiptId = digest(Buffer.from(exchange.url + ':' + exchange.status + ':' + hash));
+          if (!next.exchanges.some(existing => existing.receiptId === receiptId)) {
+            next.exchanges.push({receiptId,url:exchange.url,status:exchange.status,contentType:exchange.contentType,hash});
+          }
+        }
+        next.stream = structuredClone(streamState);
+        await replace(indexPath, Buffer.from(JSON.stringify(next, null, 2)));
+        index = next;
+        return {
+          nextOffset: next.stream.nextOffset,
+          devices: next.stream.devices.length,
+          open: Object.keys(next.stream.open).length,
+          suspended: next.stream.orphans.length,
+          anomalies: next.stream.anomalies.length,
+          exchanges: next.exchanges.length
+        };
       });
       queue = operation.catch(() => {});
       return operation;
